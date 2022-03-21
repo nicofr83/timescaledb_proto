@@ -1,0 +1,365 @@
+-- --------------
+-- DB Definition
+-- --------------
+
+drop table if exists data;
+drop table if exists devices;
+drop table if exists sites;
+
+create table sites (
+    id serial primary key not null,
+    name varchar(100) not null
+);
+
+with recursive serie(i) as
+(select 1
+ UNION ALL
+ select i + 1 from serie where i < 100)
+ insert into sites(name)
+select 'site_' || i from serie;
+select 'nb sites: ' || count(*) from sites;
+
+create table devices (
+    id serial primary key not null,
+    id_site int references sites(id) not null,
+    name varchar(100) not null
+);
+
+with recursive serie(i) as
+(select 1
+ UNION ALL
+ select i + 1 from serie where i < 100 * 2)
+ insert into devices(id, id_site, name)
+select i, ((i-1)/5)+1,  'site_' || (((i - 1)/5)+1) || '_device_' || i from serie;
+select 'nb devices: ' || count(*) from devices;
+
+select 'nb_devices: ' || count(*) from devices;
+
+
+create table data (
+    id bigserial,
+    id_device int references devices(id) not null,
+    id_site int references sites(id) not null,
+    time timestamp not null,
+    current_a float,
+    voltage_v int,
+    power_w float,
+    power_factor float,
+    energy_wh float
+);
+
+select create_hypertable('data', 'time');
+
+SELECT set_chunk_time_interval('data', 6048000000000);
+
+-- delete from data;
+
+CREATE OR REPLACE PROCEDURE load_data
+  (default_dt timestamp = '2019-01-01 00:00:00')
+language plpgsql
+AS $$
+declare 
+    start_dt timestamp;
+    start_dt_ori timestamp;
+    data_count_start int;
+    data_count_end int;
+    nb_rows_total_one_date int;
+    nb_data_5mn_missing int;
+    nb_sites int;
+    nb_devices int;
+begin
+  select count(*) from sites into nb_sites;
+  select count(*) from devices into nb_devices;
+  select nb_devices into nb_rows_total_one_date;
+  
+  select coalesce(max(time) + interval '5 minutes', default_dt) into start_dt from data;
+  select ((trunc(trunc(( (extract(epoch from now())) - (extract(epoch from  start_dt)) )/60)/5))) into  nb_data_5mn_missing;
+
+  select count(*) into data_count_start from data;
+  start_dt_ori = start_dt;
+  raise notice 'nb_sites: %, nb_devices: %', nb_sites, nb_devices;
+  raise notice 'start_dt used: (%), nb inserts for one slot: (%), number of slots (5mn) missing (%)',  start_dt, nb_rows_total_one_date, nb_data_5mn_missing;
+  while nb_data_5mn_missing > 0 loop
+        -- raise notice 'inserting data for one date-time: %', start_dt;
+		if mod(nb_data_5mn_missing, 100) = 0 then
+			raise notice 'inserting id: (%) date: (%)', nb_data_5mn_missing, start_dt;
+		end if;
+        with recursive serie(i) as
+            (select 1
+            UNION ALL
+            select i + 1 from serie where i < nb_rows_total_one_date)
+
+        insert into data(
+            id_device,
+            id_site,
+            time,
+            current_a,
+            voltage_v,
+            power_w,
+            power_factor,
+            energy_wh)
+
+        select
+            devices.id,
+            devices.id_site,
+            start_dt,
+            random() * 25,
+            random() * 30 + 210,
+            0,
+            random() * 0.10 + 0.90,
+            0
+        from serie join devices on devices.id = mod(i, nb_devices) + 1
+        union
+        select
+            devices.id,
+            devices.id_site,
+            start_dt + interval '1 minute',
+            random() * 25,
+            random() * 30 + 210,
+            0,
+            random() * 0.10 + 0.90,
+            1
+        from serie join devices on devices.id = mod(i, nb_devices) + 1
+        union
+        select
+            devices.id,
+            devices.id_site,
+            start_dt + interval '2 minutes',
+            random() * 25,
+            random() * 30 + 210,
+            0,
+            random() * 0.10 + 0.90,
+            2
+        from serie join devices on devices.id = mod(i, nb_devices) + 1
+        union
+        select
+            devices.id,
+            devices.id_site,
+            start_dt + interval '3 minutes',
+            random() * 25,
+            random() * 30 + 210,
+            0,
+            random() * 0.10 + 0.90,
+            3
+        from serie join devices on devices.id = mod(i, nb_devices) + 1
+        union
+        select
+            devices.id,
+            devices.id_site,
+            start_dt + interval '4 minutes',
+            random() * 25,
+            random() * 30 + 210,
+            0,
+            random() * 0.10 + 0.90,
+            4
+        from serie join devices on devices.id = (((i -1)/ nb_sites) + 1);
+
+        nb_data_5mn_missing = nb_data_5mn_missing - 1;
+        select start_dt + interval '5 minutes' into start_dt;
+		commit;
+    end loop;
+
+	raise notice 'calc power_w and energy_wh';
+    update data set power_w = current_a * voltage_v * (0.95 + random() * 0.10);
+    update data set energy_wh = power_w / 60 * (0.95 + random() * 0.10);
+
+    select count(*) into data_count_end from data;
+    raise notice 'row added: (%), rows per site: (%)', (data_count_end - data_count_start), ((data_count_end - data_count_start)/nb_sites);
+
+end;
+$$
+;
+
+-- ------------------
+-- timescaledb Views
+-- ------------------
+
+-- get data info
+create or replace view data_range as
+select min(time) as min, max(time) as max, count(*) as count from data;
+
+-- show global info 
+create or replace view get_data_info as
+SELECT * FROM timescaledb_information.hypertables;
+
+-- show chunks info (date range)
+create or replace view get_chunk_range as
+SELECT chunk_name, range_start, range_end FROM timescaledb_information.chunks WHERE hypertable_name in ('data') order by 2 desc;
+
+-- show row count for each chunks data
+create or replace view get_chunk_count as
+SELECT ts.chunk_name, count(o.id)
+    FROM timescaledb_information.chunks ts join data o on o.time >= ts.range_start and o.time < ts.range_end
+    WHERE hypertable_name = 'data'
+    group by 1
+    order by 1
+;
+
+-- get chunk size
+create or replace view get_chunk_size as
+select 
+    chunk_name,
+    pg_size_pretty(table_bytes) as table_bytes,
+    pg_size_pretty(index_bytes) as index_bytes,
+    pg_size_pretty(total_bytes) as total_bytes
+from chunks_detailed_size('data');
+
+-- get db size
+create or replace view get_data_size as
+select 
+    pg_size_pretty(table_bytes) as table_bytes,
+    pg_size_pretty(index_bytes) as index_bytes,
+    pg_size_pretty(total_bytes) as total_bytes
+from hypertable_detailed_size('data');
+
+-- get compression info
+-- SELECT * FROM timescaledb_information.compression_settings WHERE hypertable_name in ('obs_a', 'obs_i');
+
+-- ??
+-- SELECT * from timescaledb_information.dimensions ORDER BY hypertable_name, dimension_number;
+
+-- get global information
+-- SELECT * FROM timescaledb_information.hypertables WHERE hypertable_name in ('data');
+
+-- chunck length
+create or replace view get_chunk_length as
+SELECT h.table_name, c.interval_length FROM _timescaledb_catalog.dimension c
+JOIN _timescaledb_catalog.hypertable h ON h.id = c.hypertable_id;
+
+-- --------------
+-- material views
+-- --------------
+CREATE VIEW usage_month WITH ( timescaledb. continuous )
+AS SELECT 
+    time bucket ('1 month', time),
+    id_site,
+    id_device as device,
+    min(energy_wh) as min, 
+    max(energy_wh) as max,
+    avg(energy_wh) as avg
+FROM data
+GROUP BY 1,2,3;
+
+-- --------
+-- grafana
+-- --------
+SELECT
+  time_bucket('5m', time) AS time,
+  devices.name as device,
+  avg($measure) as $measure
+FROM data join devices on data.id_device = devices.id
+WHERE 
+  $__timeFilter("time") and data.id_site = $site and
+  ${measure:singlequote} in ('voltage_v', 'power_w') and
+  data.id_device in ($devices)
+GROUP BY 1,2
+union
+SELECT
+  time_bucket('5m', time) AS time,
+  COALESCE(devices.name, 'all') as device,
+  sum($measure) as $measure
+FROM data join devices on data.id_device = devices.id
+WHERE
+  $__timeFilter("time") and data.id_site = $site and
+  ${measure:singlequote} in ('current_a', 'energy_wh') and
+  data.id_device in ($devices)
+GROUP BY 1,2
+ORDER by 1,2
+
+-- consumption for a site when (con_type)
+select
+    timescaledb_experimental.time_bucket_ng('1 day', time) as time,
+    sum(energy_wh) as consumption,
+    'now' as aggreg
+  from data
+  where time > (now() - interval '1 week') and id_site = $site and
+  power_factor >= case when $con_type = 1 then 0.90 when $con_type = 2 then 0.95 else 0.96 end and
+  power_factor < case when $con_type = 1 then 0.95 when $con_type = 2 then 0.96 else 1 end
+  group by 1
+
+union
+
+select
+    timescaledb_experimental.time_bucket_ng('1 day', time) as time,
+    sum(energy_wh) as consumption,
+    '1 week ago'
+  from data
+  where time > (now() - interval '1 week') and id_site = $site and
+  power_factor >= case when $con_type = 1 then 0.90 when $con_type = 2 then 0.95 else 0.96 end and
+  power_factor < case when $con_type = 1 then 0.95 when $con_type = 2 then 0.96 else 1 end
+  group by 1
+  order by 1
+
+-- ----
+-- SQL
+-- ----
+
+-- get conso type
+select
+    time_bucket('1 day', time) as time,
+    case when power_factor < 0.95 then 'trading' when power_factor between 0.95 and 0.965 then 'prep' else 'closed' end,
+    sum(energy_wh) as consuption
+  from data
+  where time > '2022-01-25'
+  group by 1,3
+  order by 1,3;
+
+-- get conso type with an historical
+select
+    timescaledb_experimental.time_bucket_ng('1 day', time) as time,
+    'now',
+    case when power_factor < 0.95 then 'trading' when power_factor between 0.95 and 0.965 then 'prep' else 'closed' end,
+    sum(energy_wh) as consuption
+  from data
+  where time > now() - interval '1 week'
+  group by 1,2,3
+union
+select
+    timescaledb_experimental.time_bucket_ng('1 day', time + interval '1 week')::timestamp as time,
+    '-1week',
+    case when power_factor < 0.95 then 'trading' when power_factor between 0.95 and 0.965 then 'prep' else 'closed' end,
+    sum(energy_wh) as consuption
+  from data
+  where time between now() - interval '2weeks' and now() - interval '1 week'
+  group by 1,2,3
+
+  order by 1,2,3;
+
+-- get conso type, with 1 historical data
+select
+    timescaledb_experimental.time_bucket_ng('1 day', time) as time,
+    sum(energy_wh) as metric,
+    'now' as aggreg
+  from data
+  where time > (now() - interval '1 week') and id_site = 1 and
+  power_factor >= case when 1 = 1 then 0.90 when 1 = 2 then 0.95 else 0.96 end and
+  power_factor < case when 1 = 1 then 0.95 when 1 = 2 then 0.96 else 1 end
+  group by 1
+
+union
+
+select
+    timescaledb_experimental.time_bucket_ng('1 day', time) as time,
+    sum(energy_wh) as metric,
+    '1 week ago'
+  from data
+  where time > (now() - interval '1 week') and id_site = 1 and
+  power_factor >= case when 1 = 1 then 0.90 when 1 = 2 then 0.95 else 0.96 end and
+  power_factor < case when 1 = 1 then 0.95 when 1 = 2 then 0.96 else 1 end
+  group by 1
+  order by 1
+
+
+select time, case when step = 0 then 'now' else (-interval)::text END AS metric, consuption from
+(select step, (step||'day')::interval as interval from generate_series(0, 2) g(step)) my_steps
+ join lateral
+(SELECT
+    timescaledb_experimental.time_bucket_ng('1hour', d.time + interval)::timestamptz AS time,
+    avg(energy_wh) AS consuption
+    FROM data d
+    WHERE d.id_site = 1 and d.id_device in (1,3,5) and
+    d.time > '2022-02-01 00:00:00'::timestamptz
+    GROUP BY 1
+    ORDER BY 1
+) l on true
+order by 1
